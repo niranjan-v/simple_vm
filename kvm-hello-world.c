@@ -64,6 +64,48 @@
 #define PDE64_G (1U << 8)
 
 
+//------------------------------------------------------------------//
+#define O_MASK 0x8000
+#define O_OPEN (O_MASK | 0)
+#define O_CLOSE (O_MASK | 1)
+#define O_READ (O_MASK | 2)
+#define O_WRITE (O_MASK | 3)
+#define O_SEEK (O_MASK | 4)
+#define BS_MASK 0xE000
+#define OUT_B  (BS_MASK | 0)
+#define OUT_S (BS_MASK | 1)
+#define OUT_P (BS_MASK | 2)
+#define OUT_X (BS_MASK | 3)
+#define UNUSED_VAR 0xdeadffffu
+
+#define FETCH_U32(vcpu) (*(uint32_t*)((char *)vcpu->kvm_run + vcpu->kvm_run->io.data_offset)) // fetches uint32_t at io offset
+#define FETCH_U8(vcpu) (*(uint8_t*)((char *)vcpu->kvm_run + vcpu->kvm_run->io.data_offset))
+#define MEM_AT(vm, addr) ((char *)vm->mem+(uint64_t)addr)
+
+
+typedef struct kbuf{
+	uint32_t fd;
+	char *addr;
+	uint32_t nbytes;
+	uint32_t rbytes;
+} kbuf;
+
+typedef struct kseek{
+	uint32_t fd;
+	int offset;
+	uint32_t whence;
+	uint32_t roffset;
+} kseek;
+
+typedef struct kopen{
+	char* fname;
+	int flags;
+	int mode;
+	int fd;
+} kopen;
+
+//------------------------------------------------------------------//
+
 struct vm {
 	int sys_fd;
 	int fd;
@@ -105,7 +147,7 @@ void vm_init(struct vm *vm, size_t mem_size)
 	}
 
 	vm->mem = mmap(NULL, mem_size, PROT_READ | PROT_WRITE,
-		   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+		   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0); //## size of the guest memory = mem_size
 	if (vm->mem == MAP_FAILED) {
 		perror("mmap mem");
 		exit(1);
@@ -146,7 +188,7 @@ void vcpu_init(struct vm *vm, struct vcpu *vcpu)
 	}
 
 	vcpu->kvm_run = mmap(NULL, vcpu_mmap_size, PROT_READ | PROT_WRITE,
-			     MAP_SHARED, vcpu->fd, 0);
+			     MAP_SHARED, vcpu->fd, 0);	//##
 	if (vcpu->kvm_run == MAP_FAILED) {
 		perror("mmap kvm_run");
 		exit(1);
@@ -157,26 +199,106 @@ int run_vm(struct vm *vm, struct vcpu *vcpu, size_t sz)
 {
 	struct kvm_regs regs;
 	uint64_t memval = 0;
+	// uint32_t ret_o=UNUSED_VAR;
+	uint32_t ret_c=UNUSED_VAR;
+	uint32_t nexits=0;
 
 	for (;;) {
-		if (ioctl(vcpu->fd, KVM_RUN, 0) < 0) {
+		if (ioctl(vcpu->fd, KVM_RUN, 0) < 0) { //##
 			perror("KVM_RUN");
 			exit(1);
 		}
-
+		nexits++;
 		switch (vcpu->kvm_run->exit_reason) {
 		case KVM_EXIT_HLT:
 			goto check;
 
 		case KVM_EXIT_IO:
 			if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_OUT
-			    && vcpu->kvm_run->io.port == 0xE9) {
+			    && vcpu->kvm_run->io.port == OUT_B) {
 				char *p = (char *)vcpu->kvm_run;
 				fwrite(p + vcpu->kvm_run->io.data_offset,
 				       vcpu->kvm_run->io.size, 1, stdout);
 				fflush(stdout);
 				continue;
 			}
+
+			if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_OUT
+			    && vcpu->kvm_run->io.port == OUT_S) {
+				fprintf(stdout,"%u\n",FETCH_U32(vcpu));
+				fflush(stdout);
+				continue;
+			}
+
+			if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_OUT
+			    && vcpu->kvm_run->io.port == OUT_P) {
+				uint32_t offset=FETCH_U32(vcpu);
+				fprintf(stdout,"%s",MEM_AT(vm,offset));
+				fflush(stdout);
+				continue;
+			}	
+
+			if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_OUT
+			    && vcpu->kvm_run->io.port == OUT_X) {
+				uint32_t offset=FETCH_U32(vcpu);
+				uint32_t *addr=(uint32_t *)MEM_AT(vm,offset); 
+				*addr=nexits;
+				continue;
+			}
+
+			if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_OUT
+			    &&vcpu->kvm_run->io.port == O_OPEN) {
+				uint32_t offset = FETCH_U32(vcpu);
+				kopen *kop=(kopen*)MEM_AT(vm,offset);
+				kop->fd=open(MEM_AT(vm,kop->fname), kop->flags, kop->mode);
+				// printf("fd allotted : %u\n", fd);		
+				continue;
+			}
+
+			if (vcpu->kvm_run->io.port == O_CLOSE) {
+				
+				if (vcpu->kvm_run->io.direction == KVM_EXIT_IO_OUT){
+					uint32_t fd = FETCH_U32(vcpu);
+					ret_c=close(fd);
+					continue;
+				}
+				else{
+					if (ret_c==UNUSED_VAR){
+						FETCH_U32(vcpu)=-1;
+					}
+					else{
+
+						FETCH_U32(vcpu)=ret_c;
+						ret_c=UNUSED_VAR;
+					}
+				}
+				continue;
+			}
+
+			if (vcpu->kvm_run->io.port == O_READ && vcpu->kvm_run->io.direction == KVM_EXIT_IO_OUT) {
+				uint32_t offset = FETCH_U32(vcpu);
+				kbuf *buf=(kbuf*)MEM_AT(vm,offset);
+				// printf("offset of kbuf : %u\n", offset);
+				// printf("req rec fd : %u nbytes : %u\n", buf->fd, buf->nbytes);
+				buf->rbytes=read(buf->fd, MEM_AT(vm, buf->addr), buf->nbytes);
+				// printf("# bytes read : %u \n", buf->rbytes);
+				// printf("data read %s\n", MEM_AT(vm, buf->addr));
+				continue;
+			}
+
+			if (vcpu->kvm_run->io.port == O_WRITE && vcpu->kvm_run->io.direction == KVM_EXIT_IO_OUT) {
+				uint32_t offset = FETCH_U32(vcpu);
+				kbuf *buf=(kbuf*)MEM_AT(vm,offset);
+				buf->rbytes=write(buf->fd, MEM_AT(vm, buf->addr), buf->nbytes);
+				continue;
+			}			
+
+			if (vcpu->kvm_run->io.port == O_SEEK && vcpu->kvm_run->io.direction == KVM_EXIT_IO_OUT) {
+				uint32_t offset = FETCH_U32(vcpu);
+				kseek *ks=(kseek*)MEM_AT(vm,offset);
+				ks->roffset=lseek(ks->fd, ks->offset, ks->whence);
+				continue;
+			}			
 
 			/* fall through */
 		default:
@@ -423,16 +545,16 @@ int run_long_mode(struct vm *vm, struct vcpu *vcpu)
 	memset(&regs, 0, sizeof(regs));
 	/* Clear all FLAGS bits, except bit 1 which is always set. */
 	regs.rflags = 2;
-	regs.rip = 0;
+	regs.rip = 0; //## start exec
 	/* Create stack at top of 2 MB page and grow down. */
-	regs.rsp = 2 << 20;
+	regs.rsp = 2 << 20;	//##
 
 	if (ioctl(vcpu->fd, KVM_SET_REGS, &regs) < 0) {
 		perror("KVM_SET_REGS");
 		exit(1);
 	}
 
-	memcpy(vm->mem, guest64, guest64_end-guest64);
+	memcpy(vm->mem, guest64, guest64_end-guest64); //## guest code 
 	return run_vm(vm, vcpu, 8);
 }
 
