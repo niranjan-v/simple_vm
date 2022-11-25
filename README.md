@@ -1,5 +1,6 @@
-# A minimal KVM example
+# KVM example
 
+- Added support for I/O and filesystem hypercalls.
 kvm-hello-world is a very simple example program to demonstrate the
 use of the KVM API provided by the Linux kernel.  It acts as a very
 simple VM host, and runs a trivial program in a VM.  I tested it on
